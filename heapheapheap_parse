@@ -1,0 +1,466 @@
+#! /usr/bin/python
+
+# Heapheapheap: an Android native heap dump analyzer
+#
+# Copyright 2016 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import sys, os, pickle
+import commands
+from heapq import nlargest
+
+symbols_cache={}
+symbolpath=None
+not_found_libs=[]
+
+id = 0
+class BacktraceInfo:
+    def __init__(self, address, size, calls_count, depth, parent, is_zygote):
+      global id
+      # if parent == None:
+      #   p = "None"
+      # else:
+      #   p = parent.GetAddress()
+      # print "Adding new entry for address " + address + ", size = " + str(size) + ", de: " + str(depth) + ", parent = " + p
+      self.children = []
+      self.address = address
+      self.calls_count = int(calls_count)
+      self.size = int(size)
+      self.retained_size = self.size * self.calls_count
+      self.symbol = None
+      self.depth = depth
+      self.parent = parent
+      self.is_zygote = int(is_zygote)
+      self.id = id
+      id += 1
+
+    def __repr__(self):
+      return self.__str__()
+
+    def __str__(self):
+      if self.symbol == None:
+        symbol = "None"
+      else:
+        symbol = self.symbol
+      output = "BTinfo #" + str(self.id) + ": 0x" + self.address + " (" + symbol + "), size: " + str(self.size) + ", # Calls: " + str(self.calls_count)
+      output += "\n"
+      for child in self.children:
+        output += "\t" + str(child) + "\n"
+      output += "End of BTinfo 0x" + self.address + "\n"
+      return output
+
+    def PopulateTreeWithTrace(self, line_split, nesting_level, size, calls_count):
+      i = nesting_level + 1
+      tmp = self
+      # print "In PopulateTree"
+      while i < len(line_split):
+        new_child = BacktraceInfo(line_split[i], size, calls_count, i - 7, tmp, self.is_zygote)
+        tmp.AddChild(new_child)
+        tmp = new_child
+        i += 1
+
+    def IncrementCallsCount(self):
+      self.calls_count += 1
+
+    def AddRetainedSize(self, size, calls_count):
+      self.size += int(size)
+      self.calls_count += int(calls_count)
+      self.retained_size += int(size)* int(calls_count)
+
+    def AddChild(self, child):
+      # print "Adding child " + child.GetAddress() + " to parent " + self.GetAddress()
+      self.children.append(child)
+
+    def SetSymbol(self, symbol):
+      self.symbol = symbol
+
+    def SetChildren(self, children):
+      self.children = list(children)
+
+    def SetZygote(self, is_zygote):
+      self.is_zygote = is_zygote
+
+    def GetSymbol(self):
+      return self.symbol
+
+    def GetAddress(self):
+      return self.address
+
+    def GetChildren(self):
+      return self.children
+
+    def GetDepth(self):
+      return self.depth
+
+    def GetParent(self):
+      return self.parent
+
+    def GetSize(self):
+      return self.size
+
+    def GetRetainedSize(self):
+      return self.retained_size
+
+    def GetCallsCount(self):
+      return self.calls_count
+
+    def GetZygote(self):
+      return self.is_zygote
+
+class Snapshot(object):
+    def __init__(self):
+        self.libslist = []
+        self.allocations = {}
+        self.allocations_tree = {}
+        self.total_memory = 0
+        self.mem_threshold = 0
+        self.timestamp = 0
+
+    def GetTime(self):
+      return self.timestamp
+
+    def SetTotalMemory(self, line):
+      line_split = line.split()
+
+      if len(line_split) != 3:
+        print "Ill-formed memory total."
+        return False
+
+      self.total_memory = float(line_split[2])
+      self.mem_threshold = self.total_memory / 100
+      return True
+
+    def UpdateTotalMemory(self, new_value):
+      if self.total_memory < new_value:
+        self.total_memory = new_value
+
+    def SetTime(self, line):
+      line_split = line.split()
+
+      if len(line_split) != 2:
+        print "Ill-formed time."
+        return False
+
+      self.timestamp = int(line_split[1])
+      return True
+
+    def AddLibrary(self, line):
+      line = line.replace("(deleted)","")
+      line_split = line.split()
+
+      if len(line_split) < 6:
+        return
+
+      [start, end] = line_split[0].split('-')
+      start = int(start, 16)# + int(line_split[2], 16)
+      end = int(end, 16)# + int(line_split[2], 16)
+      self.libslist.append((line_split[5], start, end)) # (name, addr_start, addr_end)
+
+    def AddAllocation(self, line):
+      if len(line) > 0:
+        line_split = line.split()
+        if len(line_split) < 8:
+          return
+
+        # Time optimization: skip smaller allocs.
+        # if line_split[3] < self.mem_threshold:
+        #  return
+
+        cur_trace_id = 8
+
+        if line_split[8] in self.allocations_tree.keys():
+          # print "Entry " + line_split[8] + " already exists..."
+          tree = self.allocations_tree[line_split[8]]
+          # Go through the tree until there is a mismatch (if any)
+          to_go_through = []
+          to_go_through.append(tree)
+          # print "Found it again! Going to tree!"
+          # print tree
+          tree_cell = None
+          while len(to_go_through) > 0 and cur_trace_id < len(line_split):
+            tree_cell = to_go_through.pop()
+
+            if tree_cell.GetAddress() == line_split[cur_trace_id]:
+              # If there's a match, we must add the count and continue parsing down the tree
+              tree_cell.AddRetainedSize(line_split[3],line_split[5])
+              to_go_through = list(tree_cell.GetChildren())
+              cur_trace_id += 1
+            else:
+              break
+
+          if tree_cell == None:
+            print "Should not happen."
+            sys.exit(-1)
+
+          if cur_trace_id != len(line_split):
+            if cur_trace_id == 8:
+              print "Error: Cannot branch at nesting level 0"
+              sys.exit(-1)
+            # Otherwise, we create a new branch at this point.
+            # print "Found a branch at level " + str(cur_trace_id - 7) + ", creating new branch:"
+            parent = tree_cell.GetParent()
+            if len(parent.GetChildren()) == 0:
+              print "Error: Parent should have at least one child, has none."
+              sys.exit(-1)
+            child = BacktraceInfo(line_split[cur_trace_id], line_split[3], line_split[5], cur_trace_id - 7, parent, line_split[1])
+            parent.AddChild(child)
+            child.PopulateTreeWithTrace(line_split, cur_trace_id, line_split[3], line_split[5])
+          #else:
+            # print "Found exactly the same trace"
+        else:
+          # print "Adding new entry for address " + line_split[cur_trace_id]
+          new_entry = BacktraceInfo(line_split[cur_trace_id], line_split[3], line_split[5], cur_trace_id - 7, None, line_split[1])
+          # print "Size of new entry: " + str(new_entry.GetSize())
+          new_entry.PopulateTreeWithTrace(line_split, cur_trace_id, line_split[3], line_split[5])
+          self.allocations_tree[line_split[8]] = new_entry
+
+    def GetOrderedHotspots(self, max_hotspots = 10):
+      ordered_allocs = sorted(self.allocations_tree.values(), key=lambda x: x.GetRetainedSize(), reverse=True)
+      return ordered_allocs[0:max_hotspots]
+
+    def Dump(self):
+      print str(len(self.libslist)) + " libraries"
+      print str(len(self.allocations)) +  " allocations"
+      # print str(self.allocations_tree)
+
+    def GetSymbol(self, backtrace):
+      global not_found_libs
+      addr_b10 = int(backtrace, 16)
+      if addr_b10 in symbols_cache.keys():
+        return symbols_cache[addr_b10]
+
+      from_lib="Unknown"
+      found_symbol = False
+      for lib in self.libslist:
+          lib_full_path = symbolspath + lib[0]
+          # print "Address: " + str(addr_b10) + ", " + lib[0] + " begin: " + str(lib[1]) + ", end: " + str(lib[2])
+
+          if not os.path.isfile(lib_full_path) and not "vdso" in lib_full_path and not lib[0] in not_found_libs:
+            print "Error: Could not find library \"" + lib_full_path + "\". You need to fetch it from your device."
+            not_found_libs.append(lib[0])
+
+          if os.path.isfile(lib_full_path) and addr_b10 >= lib[1] and addr_b10 < lib[2]:
+            from_lib=lib[0]
+            cmd = "addr2line -C -f -p -e %s%s 0x%x" % (symbolspath, lib[0], addr_b10 - lib[1])
+            # print cmd
+            (status, output) = commands.getstatusoutput(cmd)
+            if not output.startswith("??"):
+              # print "Address: " + str(addr_b10) + ", " + lib[0] + " begin: " + str(lib[1]) + ", end: " + str(lib[2])
+              symbols_cache[addr_b10] = output
+              found_symbol = True
+              break
+
+      if found_symbol == False:
+        symbols_cache[addr_b10] = "Unresolved from " + from_lib
+
+      return symbols_cache[addr_b10]
+
+    def UpdateMemCountIfNecessary(self, hotspots):
+      hotspots_mem_count = 0
+      for bt_tree in hotspots:
+        hotspots_mem_count += bt_tree.GetRetainedSize()
+
+      self.UpdateTotalMemory(hotspots_mem_count)
+
+    def WriteOutput(self, snapshot_id, output, hotspots, timestamp, print_details):
+      # Write header
+      output.write("#-----------\nsnapshot=" + str(snapshot_id) + "\n#-----------\ntime="+ str(timestamp) + "\nmem_heap_B=" + str(int(self.total_memory)) + "\nmem_heap_extra_B=0\nmem_stacks_B=0\nheap_tree=detailed\n")
+      output.write("n" + str(len(hotspots)) + ": " + str(int(self.total_memory)) + " (heap allocation functions) malloc/new/new[], --alloc-fns, etc.\n")
+      for bt_tree in hotspots:
+        to_go_through = []
+        to_go_through.append(bt_tree)
+        if bt_tree.GetDepth() != 1:
+          print "Error: Depth is incorrect, should be 1: " + str(bt_tree.GetDepth())
+          sys.exit(-1)
+        while len(to_go_through) > 0:
+          tree_cell = to_go_through.pop(0)
+
+          spaces = " " * tree_cell.GetDepth()
+          alloc_size = tree_cell.GetRetainedSize()
+          bt_address = tree_cell.GetAddress()
+          calls_count = tree_cell.GetCallsCount()
+          bt_symbol = tree_cell.GetSymbol()
+          children = tree_cell.GetChildren()
+          children_count = len(children)
+          is_zygote = tree_cell.GetZygote()
+          percentage_of_total = round((float(alloc_size) / float(self.total_memory)) * 100, 2)
+
+          output.write(spaces + "n" + str(children_count) + ": " + str(alloc_size) + " ")
+
+          # Is the memory shared or private?
+          if is_zygote:
+            output.write("[Z] ")
+          else:
+            output.write("[A] ")
+
+          if print_details is True:
+            output.write("("+ str(percentage_of_total) + "%) Calls: " + str(calls_count) + " ")
+          output.write("0x" + str(bt_address) + ": " + bt_symbol + "\n")
+
+          to_go_through[:0] = list(children)
+
+def ResolveSymbols(snapshot, hotspots):
+  print "Resolving symbols..."
+  resolved = 0
+  for bt_tree in hotspots:
+    symbols= []
+    to_go_through = []
+    to_go_through.append(bt_tree)
+    while len(to_go_through) > 0:
+      cur_bt = to_go_through.pop()
+      symbol = snapshot.GetSymbol(cur_bt.GetAddress())
+      cur_bt.SetSymbol(symbol)
+      resolved += 1
+      to_go_through[1:1] = list(cur_bt.GetChildren())
+
+  print "Resolved " + str(resolved) + " symbols."
+
+def ParseInput(filename, snapshot):
+    f = open(filename, 'r')
+    inmaps = False
+    instack = False
+    for line in f:
+        line = line.strip()
+        if line.startswith("z"):
+            snapshot.AddAllocation(line)
+            continue
+        elif line.startswith("Total memory:"):
+          snapshot.SetTotalMemory(line)
+          continue
+        elif line.startswith("TIME:"):
+          snapshot.SetTime(line)
+          continue
+        elif line.startswith("maps") or line.startswith("MAPS"):
+          inmaps = True
+          continue
+        elif line.startswith("end") or line.startswith("END"):
+          inmaps = False
+        elif inmaps:
+          if " r-xp " in line:
+            snapshot.AddLibrary(line)
+          continue
+
+def RetrieveSnapshots(src, dst):
+  cmd = "adb wait-for-device"
+  (status, output) = commands.getstatusoutput(cmd)
+  if status != 0:
+    print output
+    return
+
+  print "Retrieving snapshots from device..."
+  cmd = "rm -rf " + dst + "heaps/"
+  (status, output) = commands.getstatusoutput(cmd)
+  if status != 0:
+    print output
+    return
+
+  cmd = "mkdir -p " + dst
+  (status, output) = commands.getstatusoutput(cmd)
+  if status != 0:
+    print output
+    return
+  cmd = "adb pull " + src + " " + dst
+  (status, output) = commands.getstatusoutput(cmd)
+  if status != 0:
+    print output
+    return
+  print "done"
+
+def WriteHeader(output):
+  output.write("desc: Heapheapheap!\ncmd: TODO\ntime_unit: s\n")
+
+def PrintHotspots(hotspots):
+  sum = 0
+  for tree in hotspots:
+    to_go_through = [tree]
+    sum += tree.GetRetainedSize()
+    while len(to_go_through) > 0:
+      cell = to_go_through.pop(0)
+      spaces = " " * cell.GetDepth()
+      print spaces + " 0x" + cell.GetAddress()  + " (RetainedSize: " + str(cell.GetRetainedSize()) + "Size: " + str(cell.GetSize()) + ", Calls: " + str(cell.GetCallsCount()) + ", Children: " + str(len(cell.GetChildren())) + ")"
+      to_go_through[:0] = list(cell.GetChildren())
+  print "Sum: " + str(sum)
+
+def TrimAndSort(hotspots, max_hotspots = 10):
+  print "Ordering hotspots"
+  for tree in hotspots:
+    to_go_through = [tree]
+    threshold = tree.GetRetainedSize() / 100
+    while len(to_go_through) > 0:
+      cell = to_go_through.pop(0)
+      # ordered_children = sorted(cell.GetChildren(), key=lambda x: x.GetSize(), reverse=True)
+      ordered_children = nlargest(max_hotspots, cell.GetChildren(), key=lambda x: x.GetRetainedSize())
+      cell.SetChildren(ordered_children)
+      to_go_through.extend(list(cell.GetChildren()))
+
+def SaveSymbolsCache():
+  global symbols_cache
+  with open('symbols.cache', 'wb') as f:
+    pickle.dump(symbols_cache, f)
+
+def LoadSymbolsCache():
+  global symbols_cache
+  if os.path.isfile("symbols.cache"):
+    with open('symbols.cache', 'rb') as f:
+      symbols_cache = pickle.load(f)
+
+
+######## MAIN #######
+
+if len(sys.argv) != 2:
+  print sys.argv[0] + " [output_file] [symbols_path]"
+  sys.exit(-1)
+
+symbolspath = os.environ["ANDROID_PRODUCT_OUT"] + "/symbols"
+parser_input = "~/.heapheapheap/"
+RetrieveSnapshots("/data/local/tmp/heaps/", "~/.heapheapheap/")
+
+output = open(sys.argv[1], "w")
+output_calls = open(sys.argv[1] + ".details", "w")
+WriteHeader(output)
+WriteHeader(output_calls)
+dump_list = [os.path.join(parser_input, f) for f in os.listdir(parser_input) if os.path.isfile(os.path.join(parser_input, f)) and os.stat(os.path.join(parser_input, f)).st_size > 0 and f.endswith(".dump")]
+dump_list.sort(key=lambda x: os.stat(os.path.join(parser_input, x)).st_mtime)
+print "Heapheapheap is going to parse " + str(len(dump_list)) + " heap snapshots in parser_input " + parser_input + "."
+
+snapshot_id = 0
+LoadSymbolsCache()
+base_timestamp = 0
+last_time = 0
+for filename in dump_list:
+  print "Converting snapshot #" + str(snapshot_id) + " (" + filename + ")..."
+  snapshot = Snapshot()
+  ParseInput(filename, snapshot)
+
+  snapshot_time = snapshot.GetTime()
+  if base_timestamp == 0:
+    base_timestamp = snapshot_time
+
+  hotspots = snapshot.GetOrderedHotspots(200)
+  TrimAndSort(hotspots, 20)
+  ResolveSymbols(snapshot, hotspots)
+  adjusted_time = snapshot_time - base_timestamp
+  if adjusted_time < last_time:
+    adjusted_time = last_time + 1
+    print "Manually adjusting snapshot #" + str(snapshot_id) + " because its timestamp is incorrect."
+  last_time = snapshot.GetTime() - base_timestamp
+  snapshot.UpdateMemCountIfNecessary(hotspots)
+  snapshot.WriteOutput(snapshot_id, output, hotspots, adjusted_time, False)
+  snapshot.WriteOutput(snapshot_id, output_calls, hotspots, adjusted_time, True)
+  snapshot_id = snapshot_id + 1
+output.close()
+output_calls.close()
+SaveSymbolsCache()
+
+# vim:ts=2:sw=2

@@ -1,0 +1,135 @@
+#!/bin/bash
+
+# Heapheapheap: an Android native heap dump analyzer
+#
+# Copyright 2016 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+SLEEP_TIME=${SLEEP_TIME:-2}
+
+function get_pid_of_program {
+  echo $(adb shell ps | grep -v "nodex" | grep $1 | head -n 1 | awk '{print $2}')
+}
+
+function wait_for_program {
+  program=$1
+
+  while [ "$(adb shell ps | grep -v "nodex" | grep $program | wc -l)" -eq "0" ]; do
+    sleep 1;
+    adb wait-for-device
+  done
+}
+
+function has_program_stopped {
+  program=$1
+
+  if [ "$(adb shell ps | grep -v "nodex" | grep $program | wc -l)" -gt "0" ]; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+function fetch_folder_to {
+  if [ ! -d "$2" ]; then
+    echo "Heapheapheap did not detect directory of symbols \"$2\"."
+    echo "Thus, some symbols might be missing."
+    echo "Do you want heapheapheap to fetch them for you? [y/n]"
+    read $answer
+
+    if [ "$answer" == "y" ]; then
+      adb pull $1 $2
+    fi
+  fi
+}
+
+function fetch_symbols_from_device {
+  folder=$(printenv ANDROID_PRODUCT_OUT)/symbols/
+
+  fetch_folder_to "/data/dalvik-cache/" "$folder/data/"
+  fetch_folder_to "/data/app/" "$folder/data/"
+  fetch_folder_to "/system/app/" "$folder/system/"
+}
+
+function is_device_setup {
+  prop=$(adb shell getprop libc.debug.malloc.options)
+  prop2=$(adb shell getprop | grep libc.debug.malloc | wc -l)
+  if [ "$prop" == "backtrace=8" ] || [ "$prop2" -gt "0" ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+if [ "$#" -ne "1" ]; then
+  echo "./Heapheapheap.sh [program_name]"
+  exit 1
+fi
+
+echo -n "Waiting for device..."
+adb wait-for-device
+echo "done"
+
+echo "Welcome to HeapHeapHeap! :-)"
+
+fetch_symbols_from_device
+
+if ! is_device_setup; then
+  echo "Your device does not appear to be setup correctly. Please use the following commands:"
+  echo -e "\tFor N: adb shell setprop libc.debug.malloc.options backtrace=8\n\tFor M: adb shell setprop libc.debug.malloc 1\n\tadb shell stop\n\tadb shell start"
+  exit
+fi
+
+echo "Clearing logcat..."
+adb logcat -c
+
+program=$1
+
+echo -n "Waiting for program \"$program\" to be started... "
+wait_for_program $program
+echo "done"
+
+folder="/data/local/tmp/heaps"
+adb shell ps | grep $program
+echo "PROGRAM: $program"
+pid=$(get_pid_of_program $program)
+
+# Reset folder from previous runs.
+adb shell "rm -rf $folder; mkdir -p $folder"
+
+echo "Heapheapheap is going to track program $program (pid: $pid) and store dumps in $folder."
+
+snapshot_id=0
+while true; do
+  echo "Taking snapshot #${snapshot_id}..."
+  output_file="$folder/snapshot_${snapshot_id}.dump"
+  adb shell "am dumpheap -n $pid $output_file"
+  sleep $SLEEP_TIME
+
+  if has_program_stopped $program; then
+    echo "Program \"$program\" has stopped running, exiting..."
+    break
+  fi
+
+  # Wait for the current dumpheap to finish before appending it the timestamp...
+  dh_count=$(adb logcat -d | grep "dumpHeapFinished" | wc -l)
+  snapshot_id=$((snapshot_id+1))
+  while [ "$dh_count" -ne "$snapshot_id" ]; do
+    dh_count=$(adb logcat -d | grep "dumpHeapFinished" | wc -l)
+    sleep 1
+  done
+  timestamp="TIME: $(date '+%s')"
+  adb shell "echo $timestamp >> $output_file"
+done
+
