@@ -32,6 +32,7 @@ massif-visualizer output.massif
 
 The GUI shows nicely the different snapshots, as long with their corresponding backtraces and resolved symbols, that are ordered by their memory footprint.
 
+![snapshot4](https://cloud.githubusercontent.com/assets/18188676/19678191/f1f75194-9ac6-11e6-9105-cecf7a3cdf7a.png)
 
 
 
